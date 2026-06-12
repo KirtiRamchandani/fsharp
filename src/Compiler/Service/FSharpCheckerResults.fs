@@ -20,6 +20,7 @@ open Internal.Utilities.TypeHashing
 open FSharp.Core.Printf
 open FSharp.Compiler
 open FSharp.Compiler.Syntax
+open FSharp.Compiler.SyntaxTreeOps
 open FSharp.Compiler.AbstractIL.IL
 open FSharp.Compiler.AccessibilityLogic
 open FSharp.Compiler.CheckExpressionsOps
@@ -676,16 +677,177 @@ type internal TypeCheckInfo
                     | None -> None)
             | _ -> [])
 
-    let GetNamedParametersAndSettableFields endOfExprPos allowObsolete =
+    // #19906: locate the call target's LongIdent in the parse tree, given the endPos that
+    // (|NewObjectOrMethodCall|_|) in ServiceParsedInputOps produced for it.
+    //
+    // The two arms below (SynExpr.New / SynExpr.App) intentionally mirror the head shapes of
+    // (|NewObjectOrMethodCall|_|) - we must accept exactly the call forms whose endPos that
+    // active pattern produces, no more, no less. To avoid restating each of the six call
+    // shapes, both arms delegate to a single recursive extractor that walks past optional
+    // SynExpr.TypeApp / SynType.App wrappers to the underlying Ident/LongIdent and computes
+    // the same "end of closing '>' or end of last ident" position. If a new call shape is
+    // ever added to (|NewObjectOrMethodCall|_|), it must also be added here.
+    let tryFindCallLongIdentAtEndPos (endOfExprPos: pos) (parseTree: ParsedInput) : LongIdent option =
+        let endOfClosingOr (mGreaterThan: range option) (fallback: pos) =
+            match mGreaterThan with
+            | Some m -> m.End
+            | None -> fallback
+
+        // Returns (LongIdent, end position of the target token: closing '>' if a type app, else end of last ident).
+        let rec exprTarget expr =
+            match expr with
+            | SynExpr.Ident id -> Some([ id ], id.idRange.End)
+            | SynExpr.LongIdent(longDotId = SynLongIdent(id = lid)) ->
+                match List.tryLast lid with
+                | Some last -> Some(lid, last.idRange.End)
+                | None -> None
+            | SynExpr.TypeApp(expr = inner; greaterRange = mGreaterThan) ->
+                match exprTarget inner with
+                | Some(lid, fallback) -> Some(lid, endOfClosingOr mGreaterThan fallback)
+                | None -> None
+            | _ -> None
+
+        let typeTarget ty =
+            match ty with
+            | SynType.LongIdent(SynLongIdent(id = lid)) ->
+                match List.tryLast lid with
+                | Some last -> Some(lid, last.idRange.End)
+                | None -> None
+            | SynType.App(typeName = StripParenTypes(SynType.LongIdent(SynLongIdent(id = lid))); greaterRange = mGreaterThan) ->
+                let fallback =
+                    match List.tryLast lid with
+                    | Some last -> last.idRange.End
+                    | None -> ty.Range.End
+
+                Some(lid, endOfClosingOr mGreaterThan fallback)
+            | _ -> None
+
+        let endsAt (candidate: (LongIdent * pos) option) =
+            match candidate with
+            | Some(lid, endPos) when posEq endPos endOfExprPos -> Some lid
+            | _ -> None
+
+        let mutable found = None
+
+        let visitor =
+            { new SyntaxVisitorBase<unit>() with
+                member _.VisitExpr(_path, _ts, defaultTraverse, expr) =
+                    let lidOpt =
+                        match expr with
+                        | SynExpr.New(targetType = ty) -> endsAt (typeTarget ty)
+                        | SynExpr.App(isInfix = false; funcExpr = funcExpr) -> endsAt (exprTarget funcExpr)
+                        | _ -> None
+
+                    match lidOpt with
+                    | Some lid ->
+                        found <- Some lid
+                        None
+                    | None -> defaultTraverse expr
+            }
+
+        SyntaxTraversal.Traverse(endOfExprPos, parseTree, visitor) |> ignore
+        found
+
+    // #19906: when typechecking fails to capture a method-group resolution at endPos (because
+    // overload resolution remained undecided, typically due to a trailing partial named arg),
+    // recover the call target from the parse tree and re-resolve it manually off the typecheck
+    // path. Uses TcResultsSink.NoSink so transient resolutions are NOT republished into the sink;
+    // the ambient DiagnosticsLogger is left unchanged, which is fine because the only diagnostics
+    // produced here are ones a subsequent dotted-completion request would have raised anyway.
+    let tryRecoverNamedParameterCompletionFromParseTree
+        (endOfExprPos: pos)
+        (parseTreeOpt: ParsedInput option)
+        (fromItem: Item -> DisplayEnv -> NameResolutionEnv -> AccessorDomain -> range -> (DisplayEnv * range * Item list) option)
+        =
+        match parseTreeOpt with
+        | None -> None
+        | Some parseTree ->
+            match tryFindCallLongIdentAtEndPos endOfExprPos parseTree with
+            | None -> None
+            | Some lid ->
+                let (nenv, ad), _ = GetBestEnvForPos endOfExprPos
+                let typeNameResInfo = TypeNameResolutionInfo.Default
+
+                // Chain through dot accesses (e.g. Type.StaticProp.InstanceMethod) when
+                // ResolveLongIdentAsExprAndComputeRange returns a partial resolution.
+                // Fuel is bounded by the number of idents in the source LongIdent: each step
+                // must consume at least one ident, so we guarantee termination even if
+                // ResolveExprDotLongIdentAndComputeRange ever returns an unchanged rest.
+                let rec chainResolve fuel (item: Item) (rest: Ident list) (itemRange: range) =
+                    match rest with
+                    | [] -> fromItem item nenv.DisplayEnv nenv ad itemRange
+                    | _ when fuel <= 0 -> None
+                    | _ ->
+                        let tyOpt =
+                            match item with
+                            | Item.Property(info = pinfo :: _) -> Some(pinfo.GetPropertyType(amap, itemRange))
+                            | Item.Value vref -> Some vref.Type
+                            | _ -> None
+
+                        match tyOpt with
+                        | None -> None
+                        | Some ty ->
+                            try
+                                let item, itemRange, _, rest, _ =
+                                    ResolveExprDotLongIdentAndComputeRange
+                                        TcResultsSink.NoSink
+                                        ncenv
+                                        (rangeOfLongIdent rest)
+                                        ad
+                                        nenv
+                                        ty
+                                        rest
+                                        typeNameResInfo
+                                        FindMemberFlag.PreferOverrides
+                                        false
+                                        None
+
+                                chainResolve (fuel - 1) item rest itemRange
+                            with
+                            | :? OperationCanceledException -> reraise ()
+                            | _ -> None
+
+                match
+                    ResolveLongIdentAsExprAndComputeRange
+                        TcResultsSink.NoSink
+                        ncenv
+                        (rangeOfLongIdent lid)
+                        ad
+                        nenv
+                        typeNameResInfo
+                        lid
+                        None
+                with
+                | Result(_, item, itemRange, _, rest, _) -> chainResolve (List.length lid) item rest itemRange
+                | Exception _ -> None
+
+    let GetNamedParametersAndSettableFields endOfExprPos allowObsolete (parseTreeOpt: ParsedInput option) =
         let cnrs =
             GetCapturedNameResolutions endOfExprPos ResolveOverloads.No
             |> ResizeArray.toList
             |> List.rev
 
-        let result =
-            match cnrs with
-            | CNR(Item.CtorGroup(_, (ctor :: _ as ctors)), _, denv, nenv, ad, m) :: _ ->
-                let props =
+        let buildFromCtors (ctor: MethInfo) (ctors: MethInfo list) denv nenv ad m =
+            let props =
+                ResolveCompletionsInType
+                    ncenv
+                    nenv
+                    ResolveCompletionTargets.SettablePropertiesAndFields
+                    m
+                    ad
+                    false
+                    ctor.ApparentEnclosingType
+                    allowObsolete
+
+            let parameters = CollectParameters ctors amap m
+            Some(denv, m, props @ parameters)
+
+        let buildFromMethods (methods: MethInfo list) denv nenv ad m =
+            let props =
+                methods
+                |> List.collect (fun meth ->
+                    let retTy = meth.GetFSharpReturnType(amap, m, meth.FormalMethodInst)
+
                     ResolveCompletionsInType
                         ncenv
                         nenv
@@ -693,32 +855,45 @@ type internal TypeCheckInfo
                         m
                         ad
                         false
-                        ctor.ApparentEnclosingType
-                        allowObsolete
+                        retTy
+                        allowObsolete)
 
-                let parameters = CollectParameters ctors amap m
-                let items = props @ parameters
-                Some(denv, m, items)
-            | CNR(Item.MethodGroup(_, methods, _), _, denv, nenv, ad, m) :: _ ->
-                let props =
-                    methods
-                    |> List.collect (fun meth ->
-                        let retTy = meth.GetFSharpReturnType(amap, m, meth.FormalMethodInst)
+            let parameters = CollectParameters methods amap m
+            Some(denv, m, props @ parameters)
 
-                        ResolveCompletionsInType
-                            ncenv
-                            nenv
-                            ResolveCompletionTargets.SettablePropertiesAndFields
-                            m
-                            ad
-                            false
-                            retTy
-                            allowObsolete)
-
-                let parameters = CollectParameters methods amap m
-                let items = props @ parameters
-                Some(denv, m, items)
+        let fromItem item denv nenv ad m =
+            match item with
+            | Item.CtorGroup(_, (ctor :: _ as ctors)) -> buildFromCtors ctor ctors denv nenv ad m
+            | Item.MethodGroup(_, (_ :: _ as methods), _) -> buildFromMethods methods denv nenv ad m
             | _ -> None
+
+        let fromCnr (CNR(item, _, denv, nenv, ad, m)) = fromItem item denv nenv ad m
+
+        // #19906: scan all captured resolutions at endPos for a Ctor/MethodGroup, not just the head.
+        // A trailing partial named arg can put a refined single-overload MethodGroup or a non-group
+        // item (Item.Value/Item.ArgName/Item.Property) at the head after List.rev, shadowing the
+        // original group on the captured-name-resolutions side.
+        let resultFromCaptured =
+            match cnrs |> List.tryPick fromCnr with
+            | Some _ as r -> r
+            | None ->
+                // Fallback: scan the dedicated method-group store directly.
+                sResolutions.CapturedMethodGroupResolutions
+                |> Seq.filter (fun (cnr: CapturedNameResolution) ->
+                    let r = cnr.Range
+                    r.EndLine = endOfExprPos.Line && r.EndColumn = endOfExprPos.Column)
+                |> Seq.tryPick fromCnr
+
+        let result =
+            match resultFromCaptured with
+            | Some _ -> resultFromCaptured
+            | None -> tryRecoverNamedParameterCompletionFromParseTree endOfExprPos parseTreeOpt fromItem
+
+        // TODO #19906: optional arguments on curried let-bound functions
+        // (e.g. `let f (?x:int) (?y:int) = ()`) are invalid F# (FS0718 - optional args are
+        // member-only). The compiler does not produce a MethodGroup/CtorGroup resolution for
+        // such bindings, so neither the captured-resolutions scan above nor the parse-tree
+        // recovery can offer the remaining named args. Deferred to a follow-up sprint.
 
         match result with
         | None -> NameResResult.Empty
@@ -1952,8 +2127,10 @@ type internal TypeCheckInfo
 
             // Completion at ' SomeMethod( ... ) ' or ' [<SomeAttribute( ... )>] ' with named arguments
             | Some(CompletionContext.ParameterList(endPos, fields)) ->
+                let parseTreeOpt = parseResultsOpt |> Option.map (fun x -> x.ParseTree)
+
                 let results =
-                    GetNamedParametersAndSettableFields endPos options.SuggestObsoleteSymbols
+                    GetNamedParametersAndSettableFields endPos options.SuggestObsoleteSymbols parseTreeOpt
 
                 let declaredItems = getDeclaredItemsNotInRangeOpWithAllSymbols ()
 
@@ -1977,7 +2154,7 @@ type internal TypeCheckInfo
                             })
 
                     match declaredItems with
-                    | None -> Some(toCompletionItems (items, denv, m))
+                    | None -> Some(filtered, denv, m)
                     | Some(declItems, declaredDisplayEnv, declaredRange) -> Some(filtered @ declItems, declaredDisplayEnv, declaredRange)
                 | _ -> declaredItems
 
