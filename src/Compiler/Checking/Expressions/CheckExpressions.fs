@@ -827,6 +827,17 @@ let rec TcSynRationalConst c =
   | SynRationalConst.Rational(numerator = p; denominator = q) -> DivRational (intToRational p) (intToRational q)
   | SynRationalConst.Paren(rationalConst = c) -> TcSynRationalConst c
 
+/// Return the range of the leading type identifier of a SynType, falling back to the type's
+/// full range. Used to emit narrow semantic-classification CNRs that don't paint surrounding
+/// `<...>` type-argument punctuation (#19905 items 4/6).
+let rec synTypeLeadingIdentRange (synType: SynType) =
+    match synType with
+    | SynType.LongIdent synLongId -> synLongId.Range
+    | SynType.App(typeName = StripParenTypes (SynType.LongIdent synLongId)) -> synLongId.Range
+    | SynType.LongIdentApp(longDotId = synLongId) -> synLongId.Range
+    | SynType.Paren(innerType, _) -> synTypeLeadingIdentRange innerType
+    | _ -> synType.Range
+
 /// Typecheck constant terms in expressions and patterns
 let TcConst (cenv: cenv) (overallTy: TType) m env synConst =
     let g = cenv.g
@@ -6047,9 +6058,14 @@ and TcExprUndelayed (cenv: cenv) (overallTy: OverallTy) env tpenv (synExpr: SynE
         // knows this is provably non-null (even for AllowNullLiteral types).
         let objTy = if g.checkNullness then replaceNullnessOfTy Nullness.KnownFromConstructor objTy else objTy
 
+        // Use the narrow leading-identifier range for the constructor item so the classifier paints
+        // only the type name as ConstructorForReferenceType/DisposableType, not the surrounding
+        // `<...>` type-arg punctuation (#19905 item 4).
+        let mObjTy = synTypeLeadingIdentRange synObjTy
+
         TcNonControlFlowExpr env <| fun env ->
         TcPropagatingExprLeafThenConvert cenv overallTy objTy env (* true *) mNewExpr (fun () ->
-          TcNewExpr cenv env tpenv objTy (Some synObjTy.Range) superInit arg mNewExpr
+          TcNewExpr cenv env tpenv objTy (Some mObjTy) superInit arg mNewExpr
         )
 
     | SynExpr.ObjExpr (synObjTy, argopt, _mWith, binds, members, extraImpls, mNewExpr, m) ->
@@ -9153,24 +9169,30 @@ and TcTypeItemThen (cenv: cenv) overallTy env nm ty tpenv mItem tinstEnclosing d
     let g = cenv.g
     let ad = env.eAccessRights
     match delayed with
-    | DelayedTypeApp(tyargs, _mTypeArgs, mExprAndTypeArgs) :: DelayedDotLookup (longId, mLongId) :: otherDelayed ->
+    | DelayedTypeApp(tyargs, _mTypeArgs, mExprAndTypeArgs) :: DelayedDotLookup (longId, _mLongId) :: otherDelayed ->
         // If Item.Types is returned then the ty will be of the form TType_app(tcref, genericTyargs) where tyargs
         // is a fresh instantiation for tcref. TcNestedTypeApplication will chop off precisely #genericTyargs args
         // and replace them by 'tyargs'
         let ty, tpenv = TcNestedTypeApplication cenv NewTyparsOK CheckCxs ItemOccurrence.UseInType WarnOnIWSAM.Yes env tpenv mExprAndTypeArgs ty tinstEnclosing tyargs
 
-        // Report information about the whole expression including type arguments to VS
+        // Report information about the type to VS. Use the narrow mItem (the type identifier only)
+        // so the classifier does not paint the surrounding `<...>` type-arg punctuation as part of the
+        // type classification (#19905 item 6).
         let item = Item.Types(nm, [ty])
-        CallNameResolutionSink cenv.tcSink (mExprAndTypeArgs, env.NameEnv, item, emptyTyparInst, ItemOccurrence.Use, env.eAccessRights)
+        CallNameResolutionSink cenv.tcSink (mItem, env.NameEnv, item, emptyTyparInst, ItemOccurrence.Use, env.eAccessRights)
         let typeNameResInfo = GetLongIdentTypeNameInfo otherDelayed
-        let item, mItem, mItemIdent, rest, afterResolution = ResolveExprDotLongIdentAndComputeRange cenv.tcSink cenv.nameResolver (unionRanges mExprAndTypeArgs mLongId) ad env.eNameResEnv ty longId typeNameResInfo IgnoreOverrides true None
+        // Resolve `.longId` using only the longId range as wholem, so the resulting mItem / Method CNR
+        // does not extend back across the `<...>` type-arg span (#19905 item 6).
+        let item, mItem, mItemIdent, rest, afterResolution = ResolveExprDotLongIdentAndComputeRange cenv.tcSink cenv.nameResolver (rangeOfLid longId) ad env.eNameResEnv ty longId typeNameResInfo IgnoreOverrides true None
         TcItemThen cenv overallTy env tpenv ((argsOfAppTy g ty), item, mItem, mItemIdent, rest, afterResolution) None otherDelayed
 
     | DelayedTypeApp(tyargs, _mTypeArgs, mExprAndTypeArgs) :: _delayed' ->
         // A case where we have an incomplete name e.g. 'Foo<int>.' - we still want to report it to VS!
         let ty, _ = TcNestedTypeApplication cenv NewTyparsOK CheckCxs ItemOccurrence.UseInType WarnOnIWSAM.Yes env tpenv mExprAndTypeArgs ty tinstEnclosing tyargs
         let item = Item.Types(nm, [ty])
-        CallNameResolutionSink cenv.tcSink (mExprAndTypeArgs, env.NameEnv, item, emptyTyparInst, ItemOccurrence.Use, env.eAccessRights)
+        // Use the narrow mItem range so the type classification does not paint the surrounding
+        // `<...>` type-arg punctuation (#19905 items 4/6).
+        CallNameResolutionSink cenv.tcSink (mItem, env.NameEnv, item, emptyTyparInst, ItemOccurrence.Use, env.eAccessRights)
 
         // Same error as in the following case
         error(Error(FSComp.SR.tcInvalidUseOfTypeName(), mItem))
@@ -9216,7 +9238,10 @@ and TcMethodItemThen (cenv: cenv) overallTy env item methodName minfos tpenv mIt
         // FUTURE: can we do better than emptyTyparInst here, in order to display instantiations
         // of type variables in the quick info provided in the IDE? But note we haven't yet even checked if the
         // number of type arguments is correct...
-        CallNameResolutionSink cenv.tcSink (mExprAndTypeArgs, env.NameEnv, item, emptyTyparInst, ItemOccurrence.Use, env.eAccessRights)
+        // Note: we deliberately use the narrow mItem range here (the identifier-only range), not
+        // mExprAndTypeArgs, so the semantic classifier paints only the method identifier as a Method
+        // and not the surrounding `<...>` type-arg punctuation (#19905 item 3).
+        CallNameResolutionSink cenv.tcSink (mItem, env.NameEnv, item, emptyTyparInst, ItemOccurrence.Use, env.eAccessRights)
 
         match otherDelayed with
         | DelayedApp(atomicFlag, _, _, arg, mExprAndArg) :: otherDelayed ->
@@ -9250,7 +9275,10 @@ and TcCtorItemThen (cenv: cenv) overallTy env item nm minfos tinstEnclosing tpen
     | DelayedTypeApp(tyargs, _mTypeArgs, mExprAndTypeArgs) :: DelayedApp(_, _, _, arg, mExprAndArg) :: otherDelayed ->
 
         let objTyAfterTyArgs, tpenv = TcNestedTypeApplication cenv NewTyparsOK CheckCxs ItemOccurrence.UseInType WarnOnIWSAM.Yes env tpenv mExprAndTypeArgs objTy tinstEnclosing tyargs
-        CallExprHasTypeSink cenv.tcSink (mExprAndArg, env.NameEnv, objTyAfterTyArgs, env.eAccessRights)
+        // Use the narrow mItem range (the constructor identifier only), not mExprAndArg, so the
+        // semantic classifier does not paint the surrounding `<...>` type-arg punctuation or the
+        // ctor-call argument span with the type/ctor classification (#19905 item 4).
+        CallExprHasTypeSink cenv.tcSink (mItem, env.NameEnv, objTyAfterTyArgs, env.eAccessRights)
         let itemAfterTyArgs, minfosAfterTyArgs =
 #if !NO_TYPEPROVIDERS
             // If the type is provided and took static arguments then the constructor will have changed
@@ -9273,8 +9301,10 @@ and TcCtorItemThen (cenv: cenv) overallTy env item nm minfos tinstEnclosing tpen
         let objTy, tpenv = TcNestedTypeApplication cenv NewTyparsOK CheckCxs ItemOccurrence.UseInType WarnOnIWSAM.Yes env tpenv mExprAndTypeArgs objTy tinstEnclosing tyargs
 
         // A case where we have an incomplete name e.g. 'Foo<int>.' - we still want to report it to VS!
+        // Use the narrow mItem range (the ctor identifier only) so the classifier does not paint the
+        // surrounding `<...>` type-arg punctuation as part of the type/ctor classification (#19905 item 4/6).
         let resolvedItem = Item.Types(nm, [objTy])
-        CallNameResolutionSink cenv.tcSink (mExprAndTypeArgs, env.NameEnv, resolvedItem, emptyTyparInst, ItemOccurrence.Use, env.eAccessRights)
+        CallNameResolutionSink cenv.tcSink (mItem, env.NameEnv, resolvedItem, emptyTyparInst, ItemOccurrence.Use, env.eAccessRights)
 
         minfos |> List.iter (fun minfo -> UnifyTypes cenv env mExprAndTypeArgs minfo.ApparentEnclosingType objTy)
         TcCtorCall true cenv env tpenv overallTy objTy (Some mItemIdent) item false [] mExprAndTypeArgs otherDelayed (Some afterResolution)

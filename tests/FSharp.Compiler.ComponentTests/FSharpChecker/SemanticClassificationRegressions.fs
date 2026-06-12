@@ -333,7 +333,7 @@ let myNewList = [
 
 /// (#19905 item 3) Generic static method call `Type.Method<int>()` must not emit a Method
 /// classification covering the `<int>` type-argument text.
-[<Fact(Skip = "Tracked in #19905 item 3 - Method classification spans <int> on generic method call (pending fix sprint)")>]
+[<Fact>]
 let ``19905 item 3 - generic static method does not classify type args as method`` () =
     let source =
         """
@@ -374,7 +374,7 @@ let y, z = MyType.Method2<int, string>()
 
 /// (#19905 item 4) Generic constructor `new MailboxProcessor<int * int>(.)` must not emit a
 /// type classification covering the `<int * int>` text.
-[<Fact(Skip = "Tracked in #19905 item 4 - DisposableType classification spans <int * int> on generic ctor (pending fix sprint)")>]
+[<Fact>]
 let ``19905 item 4 - generic ctor does not classify type args as type`` () =
     let source =
         """
@@ -435,7 +435,7 @@ let x = list[0..]
 
 /// (#19905 item 6) Generic-type static method call `MailboxProcessor<int>.Start(.)` must not
 /// emit a Method classification whose range starts before the `.` (i.e., spans the type name).
-[<Fact(Skip = "Tracked in #19905 item 6 - Method classification spans 'MailboxProcessor<int>.Start' instead of just 'Start' (pending fix sprint)")>]
+[<Fact>]
 let ``19905 item 6 - generic type static method classifies only the method name`` () =
     let source =
         """

@@ -2086,7 +2086,7 @@ let ``Test Project11 all symbols`` () =
             ("int", "int", "file1", ((4, 57), (4, 60)), [], ["abbrev"]);
             ("Enumerator", "Enumerator", "file1", ((4, 62), (4, 72)), ["type"],
              ["valuetype"]);
-            ("member .ctor", "Enumerator", "file1", ((4, 15), (4, 72)), [], ["member"]);
+            ("member .ctor", "Enumerator", "file1", ((4, 62), (4, 72)), [], ["member"]);
             ("val enum", "enum", "file1", ((4, 4), (4, 8)), ["defn"], ["val"]);
             ("System", "System", "file1", ((5, 11), (5, 17)), [], ["namespace"]);
             ("Collections", "Collections", "file1", ((5, 18), (5, 29)), [], ["namespace"]);
@@ -2798,8 +2798,7 @@ let ``Test Project17 all symbols`` () =
             ("FSharp", "FSharp", "file1", ((4, 18), (4, 24)), [], ["namespace"]);
             ("FSharpList`1", "List", "file1", ((4, 8), (4, 41)), [], ["union"]);
             ("int", "int", "file1", ((4, 42), (4, 45)), ["type"], ["abbrev"]);
-            ("FSharpList`1", "List", "file1", ((4, 8), (4, 46)), [], ["union"]);
-            ("property Empty", "Empty", "file1", ((4, 8), (4, 52)), [], ["member"; "prop"]);
+            ("property Empty", "Empty", "file1", ((4, 47), (4, 52)), [], ["member"; "prop"]);
             ("System", "System", "file1", ((6, 11), (6, 17)), [], ["namespace"]);
             ("Collections", "Collections", "file1", ((6, 18), (6, 29)), [], ["namespace"]);
             ("Generic", "Generic", "file1", ((6, 30), (6, 37)), [], ["namespace"]);
@@ -2880,8 +2879,8 @@ let ``Test Project18 all symbols`` () =
 
     allUsesOfAllSymbols |> shouldEqual
       [|("list`1", "list", "file1", ((4, 8), (4, 12)), [], false);
-        ("list`1", "list", "file1", ((4, 8), (4, 15)), [], false);
-        ("property Empty", "Empty", "file1", ((4, 8), (4, 21)), [], false);
+        ("list`1", "list", "file1", ((4, 8), (4, 12)), [], false);
+        ("property Empty", "Empty", "file1", ((4, 16), (4, 21)), [], false);
         ("Impl", "Impl", "file1", ((2, 7), (2, 11)), ["defn"], false)|]
 
 
