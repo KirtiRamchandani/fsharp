@@ -298,7 +298,7 @@ type SumDelegate = delegate of x: int * y: int -> int
 
 /// (#19905 item 2) Computation expression builder identifier used inside a list comprehension
 /// must be classified as ComputationExpression on every occurrence, not as Value/LocalValue.
-[<Fact(Skip = "Tracked in #19905 item 2 - CE builder inside [ for .. do .. ] classifies as Value (pending fix sprint)")>]
+[<Fact>]
 let ``19905 item 2 - CE inside list comp classified as ComputationExpression`` () =
     let source =
         """
@@ -319,17 +319,46 @@ let myNewList = [
 """
     let items = getClassifications source
     // Line 12: "        optional {"
-    let ceItems =
+    let ceLine = 12
+
+    let optionalClassifications =
         items
         |> Array.filter (fun c ->
-            c.Range.StartLine = 12
-            && substringOfRange source c.Range = "optional"
-            && c.Type = SemanticClassificationType.ComputationExpression)
+            c.Range.StartLine = ceLine
+            && substringOfRange source c.Range = "optional")
+
     Assert.True(
-        ceItems.Length >= 1,
-        sprintf "Expected a ComputationExpression classification for 'optional' on line 12, got: %A"
-            (items |> Array.filter (fun c -> c.Range.StartLine = 12)
-                   |> Array.map (fun c -> c.Range.StartColumn, c.Range.EndColumn, c.Type)))
+        optionalClassifications
+        |> Array.exists (fun c -> c.Type = SemanticClassificationType.ComputationExpression),
+        sprintf "Expected `optional` on line %d to have a ComputationExpression classification, but got: %A"
+            ceLine (optionalClassifications |> Array.map (fun c -> c.Type)))
+
+    // And ensure no Value/LocalValue paints over the same span (would still
+    // visually wash out the CE colour in VS).
+    Assert.True(
+        optionalClassifications
+        |> Array.forall (fun c ->
+            c.Type <> SemanticClassificationType.Value
+            && c.Type <> SemanticClassificationType.LocalValue),
+        sprintf "`optional` on line %d should not have a Value/LocalValue classification: %A"
+            ceLine (optionalClassifications |> Array.map (fun c -> c.Type)))
+
+/// (#19905 item 2 negative) Plain `async { .. }` outside a comprehension still classifies as CE.
+[<Fact>]
+let ``19905 item 2 negative - plain CE classification unchanged`` () =
+    let source =
+        """
+module Test
+let _ = async { return 1 }
+"""
+    let items = getClassifications source
+    Assert.True(
+        items
+        |> Array.exists (fun c ->
+            c.Range.StartLine = 3
+            && substringOfRange source c.Range = "async"
+            && c.Type = SemanticClassificationType.ComputationExpression),
+        "`async` should still classify as ComputationExpression")
 
 /// (#19905 item 3) Generic static method call `Type.Method<int>()` must not emit a Method
 /// classification covering the `<int>` type-argument text.

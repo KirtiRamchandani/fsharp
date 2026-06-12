@@ -178,29 +178,36 @@ module TcResolutionsExtensions =
                             | _ -> None
                         | _ -> None
 
-                    // Custom builders like 'async { }' are both Item.Value and Item.CustomBuilder.
-                    // We should prefer the latter, otherwise they would not get classified as CEs.
+                    // Custom builders like 'async { }' are both Item.Value and Item.CustomBuilder
+                    // (and sometimes additional Item.CustomOperation entries inside a list/array
+                    // comprehension's CE-machinery). We should prefer any CustomBuilder/CustomOperation
+                    // hit over the Value one so the builder name gets a ComputationExpression
+                    // classification instead of being painted as a local value.
                     let takeCustomBuilder (cnrs: CapturedNameResolution[]) =
                         assert (cnrs.Length > 0)
 
-                        if cnrs.Length = 1 then
+                        let preferred =
                             cnrs
-                        elif cnrs.Length = 2 then
-                            match cnrs[0].Item, cnrs[1].Item with
-                            | Item.Value _, Item.CustomBuilder _ -> [| cnrs[1] |]
-                            | Item.CustomBuilder _, Item.Value _ -> [| cnrs[0] |]
-                            | _ -> cnrs
-                        else
-                            cnrs
+                            |> Array.filter (fun cnr ->
+                                match cnr.Item with
+                                | Item.CustomBuilder _
+                                | Item.CustomOperation _ -> true
+                                | _ -> false)
+
+                        if preferred.Length > 0 then preferred else cnrs
 
                     let resolutions =
+                        let groupAndPickBuilder (cnrs: CapturedNameResolution[]) =
+                            cnrs
+                            |> Array.groupBy (fun cnr -> cnr.Range)
+                            |> Array.collect (fun (_, cnrs) -> takeCustomBuilder cnrs)
+
                         match range with
                         | Some range ->
                             sResolutions.CapturedNameResolutions.ToArray()
                             |> Array.filter (fun cnr -> rangeContainsPos range cnr.Range.Start || rangeContainsPos range cnr.Range.End)
-                            |> Array.groupBy (fun cnr -> cnr.Range)
-                            |> Array.collect (fun (_, cnrs) -> takeCustomBuilder cnrs)
-                        | None -> sResolutions.CapturedNameResolutions.ToArray()
+                            |> groupAndPickBuilder
+                        | None -> sResolutions.CapturedNameResolutions.ToArray() |> groupAndPickBuilder
 
                     let duplicates = HashSet<range>(comparer)
 
