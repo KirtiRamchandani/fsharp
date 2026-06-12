@@ -559,3 +559,58 @@ let _ = Greet()
         unusedOnOpenLine.IsEmpty,
         sprintf "'open type Inner.Helper' (line 6) must not be flagged unused; got ranges: %A"
             (unusedOnOpenLine |> List.map (fun r -> r.StartLine, r.StartColumn, r.EndColumn)))
+
+/// (#19905 item 7 negative) `open type X.Y` with no usage of any imported member must still
+/// be reported as unused. Guards against the fix over-reaching and silencing all `open type`.
+[<Fact>]
+let ``19905 item 7 negative - open type with no usage is still flagged unused`` () =
+    let source =
+        """
+module Test
+module Inner =
+    type Helper() =
+        static member Greet() = "hi"
+open type Inner.Helper
+let _ = 1
+"""
+    let fileName, snapshot, checker = singleFileChecker source
+    let results = checker.ParseAndCheckFileInProject(fileName, snapshot) |> Async.RunSynchronously
+    let checkResults = getTypeCheckResult results
+    let lines = source.Replace("\r\n", "\n").Split('\n')
+    let getSourceLineStr n =
+        if n >= 1 && n <= lines.Length then lines[n - 1] else ""
+    let unused =
+        UnusedOpens.getUnusedOpens(checkResults, getSourceLineStr)
+        |> Async.RunSynchronously
+    let unusedOnOpenLine =
+        unused
+        |> List.filter (fun r -> r.StartLine = 6)
+    Assert.True(
+        not unusedOnOpenLine.IsEmpty,
+        "'open type Inner.Helper' with no usage of imported members must still be flagged unused")
+
+/// (#19905 item 7 regression-guard) Plain `open Namespace` whose contents are unused must still
+/// be reported as unused. Guards against the splitSymbolUses change regressing the namespace case.
+[<Fact>]
+let ``19905 item 7 regression - unused open System is still flagged unused`` () =
+    let source =
+        """
+module Test
+open System
+let _ = 1
+"""
+    let fileName, snapshot, checker = singleFileChecker source
+    let results = checker.ParseAndCheckFileInProject(fileName, snapshot) |> Async.RunSynchronously
+    let checkResults = getTypeCheckResult results
+    let lines = source.Replace("\r\n", "\n").Split('\n')
+    let getSourceLineStr n =
+        if n >= 1 && n <= lines.Length then lines[n - 1] else ""
+    let unused =
+        UnusedOpens.getUnusedOpens(checkResults, getSourceLineStr)
+        |> Async.RunSynchronously
+    let unusedOnOpenLine =
+        unused
+        |> List.filter (fun r -> r.StartLine = 3)
+    Assert.True(
+        not unusedOnOpenLine.IsEmpty,
+        "'open System' with no usage must still be flagged unused")

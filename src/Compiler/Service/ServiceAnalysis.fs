@@ -273,19 +273,26 @@ module UnusedOpens =
     /// Async to allow cancellation.
     let filterOpenStatements (symbolUses1: FSharpSymbolUse[], symbolUses2: FSharpSymbolUse[]) openStatements =
         async {
-            // the key is a namespace or module, the value is a list of FSharpSymbolUse range of symbols defined in the
-            // namespace or module. So, it's just symbol uses ranges grouped by namespace or module where they are _defined_.
+            // the key is a namespace, module, or type entity, the value is a list of FSharpSymbolUse range of symbols
+            // defined in that entity. So, it's just symbol uses ranges grouped by the entity where they are _defined_.
+            // Type entities are kept here so that `open type T` is recognised as used when its imported members are.
+            // `symbolUses2` still flows through the RevealedSymbols path below, so this is purely additive.
             let symbolUsesRangesByDeclaringEntity =
                 Dictionary<FSharpEntity, range list>(entityHash)
 
-            for symbolUse in symbolUses1 do
+            let recordByDeclaringEntity (symbolUse: FSharpSymbolUse) =
                 match symbolUse.Symbol with
                 | :? FSharpMemberOrFunctionOrValue as f ->
                     match f.DeclaringEntity with
-                    | Some entity when entity.IsNamespace || entity.IsFSharpModule ->
-                        symbolUsesRangesByDeclaringEntity.BagAdd(entity, symbolUse.Range)
-                    | _ -> ()
+                    | Some entity -> symbolUsesRangesByDeclaringEntity.BagAdd(entity, symbolUse.Range)
+                    | None -> ()
                 | _ -> ()
+
+            for symbolUse in symbolUses1 do
+                recordByDeclaringEntity symbolUse
+
+            for symbolUse in symbolUses2 do
+                recordByDeclaringEntity symbolUse
 
             let! results =
                 filterOpenStatementsIncremental
