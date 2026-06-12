@@ -6787,7 +6787,7 @@ and ExpandIndexArgs (cenv: cenv) (synLeftExprOpt: SynExpr option) indexArgs =
                    | Some (a2, isFromEnd2) ->
                        yield mkSynSomeExpr range2 (if isFromEnd2 then rewriteReverseExpr pos a2 range2 else a2)
                    | None ->
-                       yield mkSynNoneExpr range1
+                       yield mkSynNoneExpr range2
                 ]
         )
         |> List.collect id
@@ -6941,11 +6941,18 @@ and TcIndexingThen cenv env overallTy mWholeExpr mDot tpenv setInfo synLeftExprO
             match propName with
             | None -> "Item"
             | Some nm -> nm
+        // For slice expressions (not regular indexing), the synthesized GetSlice/SetSlice
+        // identifier has no user-visible source range. Use a synthetic range so the name
+        // resolution sink (NotifyNameResolution) drops the CNR, otherwise the semantic
+        // classifier paints the entire `list[...]` span as Method (#19905 item 5).
+        // Regular indexing (`x.[n]`/`x[n]`) keeps the visible range so find-all-references
+        // continues to surface implicit Item indexer usages.
+        let mNm = if isIndex then mWholeExpr else mWholeExpr.MakeSynthetic()
         let delayed =
             match setInfo with
             // expr1.[expr2]
             | None  ->
-                [ DelayedDotLookup([ ident(nm, mWholeExpr)], mWholeExpr)
+                [ DelayedDotLookup([ ident(nm, mNm)], mNm)
                   DelayedApp(ExprAtomicFlag.Atomic, true, synLeftExprOpt, MakeIndexParam None, mWholeExpr)
                   yield! delayed ]
 
@@ -6957,7 +6964,8 @@ and TcIndexingThen cenv env overallTy mWholeExpr mDot tpenv setInfo synLeftExprO
                       MakeDelayedSet(expr3, mWholeExpr)
                       yield! delayed ]
                 else
-                    [ DelayedDotLookup([ident("SetSlice", mOfLeftOfSet)], mOfLeftOfSet)
+                    let mSynNm = mOfLeftOfSet.MakeSynthetic()
+                    [ DelayedDotLookup([ident("SetSlice", mSynNm)], mSynNm)
                       DelayedApp(ExprAtomicFlag.Atomic, true, synLeftExprOpt, MakeIndexParam (Some expr3), mWholeExpr)
                       yield! delayed ]
 

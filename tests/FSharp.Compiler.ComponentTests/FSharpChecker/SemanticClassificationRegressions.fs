@@ -411,7 +411,7 @@ let myMailbox = new MailboxProcessor<int * int>(fun mbx -> async { return () })
 
 /// (#19905 item 5) Open-ended slice `list[0..]` must not emit a Method/Function classification
 /// whose range ends at the closing `]`.
-[<Fact(Skip = "Tracked in #19905 item 5 - Method classification spans list[0..] including trailing ] (pending fix sprint)")>]
+[<Fact>]
 let ``19905 item 5 - open-ended slice does not classify closing bracket as function`` () =
     let source =
         """
@@ -431,6 +431,61 @@ let x = list[0..]
     Assert.True(
         badSpans.Length = 0,
         sprintf "No Method/Function classification on line 4 should end at column 17 (the ']'). Found: %A"
+            (badSpans |> Array.map (fun c -> c.Range.StartColumn, c.Range.EndColumn, c.Type)))
+
+/// (#19905 item 5 sibling) Open-ended lower slice `list[..2]` must not emit a Method/Function
+/// classification whose range starts at the opening `[`.
+[<Fact>]
+let ``19905 item 5 - open-ended lower slice does not classify opening bracket as function`` () =
+    let source =
+        """
+module Test
+let list = [1; 2; 3]
+let x = list[..2]
+"""
+    let items = getClassifications source
+    // Line 4: "let x = list[..2]"  — opening '[' is at column 12.
+    let badSpans =
+        items
+        |> Array.filter (fun c ->
+            c.Range.StartLine = 4
+            && (c.Type = SemanticClassificationType.Method
+                || c.Type = SemanticClassificationType.Function)
+            && c.Range.StartColumn <= 12
+            && c.Range.EndColumn >= 17)
+    Assert.True(
+        badSpans.Length = 0,
+        sprintf "No Method/Function classification on line 4 should span the whole `list[..2]` expression. Found: %A"
+            (badSpans |> Array.map (fun c -> c.Range.StartColumn, c.Range.EndColumn, c.Type)))
+
+/// (#19905 item 5 negative) Closed slice `list[0..2]` must not emit a wide Method/Function
+/// classification that spans `list[0..2]` either - regression guard to ensure the
+/// open-ended slice fix also covers the closed-slice path (same code path in TcIndexingThen).
+[<Fact>]
+let ``19905 item 5 negative - closed slice classification unchanged`` () =
+    let source =
+        """
+module Test
+let list = [1; 2; 3]
+let x = list[0..2]
+"""
+    let items = getClassifications source
+    Assert.True(
+        items |> Array.exists (fun c -> c.Range.StartLine = 4),
+        "Expected at least one classification on line 4 for the closed slice")
+    // Line 4: "let x = list[0..2]" — closing ']' is at column 18. No Method/Function
+    // classification on line 4 should reach the `]` (it would paint the synthesized
+    // GetSlice lookup as Method, identical to the open-ended bug).
+    let badSpans =
+        items
+        |> Array.filter (fun c ->
+            c.Range.StartLine = 4
+            && (c.Type = SemanticClassificationType.Method
+                || c.Type = SemanticClassificationType.Function)
+            && c.Range.EndColumn = 18)
+    Assert.True(
+        badSpans.Length = 0,
+        sprintf "No Method/Function classification on line 4 should end at column 18 (the ']'). Found: %A"
             (badSpans |> Array.map (fun c -> c.Range.StartColumn, c.Range.EndColumn, c.Type)))
 
 /// (#19905 item 6) Generic-type static method call `MailboxProcessor<int>.Start(.)` must not
