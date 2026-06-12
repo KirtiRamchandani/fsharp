@@ -861,3 +861,69 @@ normaliz{caret}
 """
 
     assertHasItemWithNames [ "normalize'" ] info
+
+// Issue #19906 - IntelliSense stops suggesting later named args after the first one.
+// Tests 1-4 reproduce the bug (expected to FAIL before the fix, PASS after).
+// Tests 5-7 are regression guards (expected to PASS before AND after the fix).
+
+[<Fact>]
+let ``Issue 19906 - named arg completion - non-overloaded method - second arg partial`` () =
+    let info = Checker.getCompletionInfo """
+type T() = member _.M(apple:int, banana:int, cherry:int) = ()
+let t = T()
+let _ = t.M(apple=1, b{caret})
+"""
+    assertHasItemWithNames ["banana"; "cherry"] info
+    assertHasNoItemsWithNames ["apple"] info
+
+[<Fact>]
+let ``Issue 19906 - named arg completion - overloaded Task Factory StartNew - second arg partial`` () =
+    let info = Checker.getCompletionInfo """
+open System.Threading.Tasks
+let _ = Task.Factory.StartNew(action=(fun _ -> ()), s{caret})
+"""
+    assertHasItemWithNames ["state"; "cancellationToken"; "scheduler"; "creationOptions"] info
+    assertHasNoItemsWithNames ["action"] info
+
+[<Fact>]
+let ``Issue 19906 - named arg completion - overloaded Task Factory StartNew - third arg partial`` () =
+    let info = Checker.getCompletionInfo """
+open System.Threading.Tasks
+let _ = Task.Factory.StartNew(action=(fun _ -> ()), state=null, c{caret})
+"""
+    assertHasItemWithNames ["cancellationToken"; "creationOptions"] info
+
+[<Fact>]
+let ``Issue 19906 - named arg completion - optional args - second arg partial`` () =
+    let info = Checker.getCompletionInfo """
+let f (?x:int) (?y:int) (?z:int) = ()
+let _ = f(?x=1, ?y{caret})
+"""
+    assertHasItemWithNames ["y"; "z"] info
+
+[<Fact>]
+let ``Issue 19906 - regression guard - zero-arg ctor + settable props - second arg partial`` () =
+    let info = Checker.getCompletionInfo """
+type R() =
+    member val Apple = "" with get, set
+    member val Banana = "" with get, set
+    member val Cherry = "" with get, set
+let _ = R(Apple="x", B{caret})
+"""
+    assertHasItemWithNames ["Banana"; "Cherry"] info
+
+[<Fact>]
+let ``Issue 19906 - regression guard - positional then partial named on overloaded method`` () =
+    let info = Checker.getCompletionInfo """
+open System.Threading.Tasks
+let _ = Task.Factory.StartNew((fun _ -> ()), s{caret})
+"""
+    assertHasItemWithNames ["state"; "cancellationToken"; "scheduler"; "creationOptions"] info
+
+[<Fact>]
+let ``Issue 19906 - regression guard - dotted completion inside named arg RHS`` () =
+    let info = Checker.getCompletionInfo """
+let s = "x"
+let _ = System.Uri(uriString = s.{caret}, kind = System.UriKind.Absolute)
+"""
+    assertHasItemWithNames ["Length"; "Substring"] info
