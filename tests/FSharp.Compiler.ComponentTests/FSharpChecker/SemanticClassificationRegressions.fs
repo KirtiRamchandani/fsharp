@@ -271,3 +271,236 @@ type MyDelegate = delegate of int -> string
             && (let text = substringOfRange source c.Range
                 text = "BeginInvoke" || text = "EndInvoke"))
     Assert.Empty(asyncInvokeMethods)
+
+// =====================================================================
+// Issue #19905 - F# editor classification cluster (Phase 0 verification)
+// Each test below pins down the CURRENT behaviour observed on HEAD.
+// Facts that document an unfixed bug are marked [<Fact(Skip = ...)>]
+// and will be un-skipped (and inverted) by their corresponding fix sprint.
+// =====================================================================
+
+/// (#19905 item 1) Delegate signature must not produce a synthesized Invoke Method classification.
+/// Already fixed by #19813. Sibling coverage exists at
+/// `Delegate Invoke in declaration not classified as method` above; this is a Phase 0 confirmation.
+[<Fact>]
+let ``19905 item 1 - delegate sig not classified as method`` () =
+    let source =
+        """
+type SumDelegate = delegate of x: int * y: int -> int
+"""
+    let items = getClassifications source
+    let invokeMethods =
+        items
+        |> Array.filter (fun c ->
+            c.Type = SemanticClassificationType.Method
+            && substringOfRange source c.Range = "Invoke")
+    Assert.Empty(invokeMethods)
+
+/// (#19905 item 2) Computation expression builder identifier used inside a list comprehension
+/// must be classified as ComputationExpression on every occurrence, not as Value/LocalValue.
+[<Fact(Skip = "Tracked in #19905 item 2 - CE builder inside [ for .. do .. ] classifies as Value (pending fix sprint)")>]
+let ``19905 item 2 - CE inside list comp classified as ComputationExpression`` () =
+    let source =
+        """
+module Test
+type OptionalBuilder() =
+    member _.Zero() = None
+    member _.Bind(x, f) = Option.bind f x
+    member _.Return(x) = Some x
+    member _.ReturnFrom(x) = x
+let optional = OptionalBuilder()
+let myList = [1; 2; 3]
+let myNewList = [
+    for i in myList do
+        optional {
+            return! Some(i+1)
+        }
+]
+"""
+    let items = getClassifications source
+    // Line 12: "        optional {"
+    let ceItems =
+        items
+        |> Array.filter (fun c ->
+            c.Range.StartLine = 12
+            && substringOfRange source c.Range = "optional"
+            && c.Type = SemanticClassificationType.ComputationExpression)
+    Assert.True(
+        ceItems.Length >= 1,
+        sprintf "Expected a ComputationExpression classification for 'optional' on line 12, got: %A"
+            (items |> Array.filter (fun c -> c.Range.StartLine = 12)
+                   |> Array.map (fun c -> c.Range.StartColumn, c.Range.EndColumn, c.Type)))
+
+/// (#19905 item 3) Generic static method call `Type.Method<int>()` must not emit a Method
+/// classification covering the `<int>` type-argument text.
+[<Fact(Skip = "Tracked in #19905 item 3 - Method classification spans <int> on generic method call (pending fix sprint)")>]
+let ``19905 item 3 - generic static method does not classify type args as method`` () =
+    let source =
+        """
+module Test
+type MyType() =
+    static member Method<'a>() = Unchecked.defaultof<'a>
+    static member Method2<'a, 'b>() = Unchecked.defaultof<'a>, Unchecked.defaultof<'b>
+let x = MyType.Method<int>()
+let y, z = MyType.Method2<int, string>()
+"""
+    let items = getClassifications source
+    // Line 6: "let x = MyType.Method<int>()"
+    //         "MyType" ends at col 14, ".Method" ends at col 21, "<int>" ends at col 26.
+    let badL6 =
+        items
+        |> Array.filter (fun c ->
+            c.Range.StartLine = 6
+            && (c.Type = SemanticClassificationType.Method
+                || c.Type = SemanticClassificationType.Function)
+            && c.Range.EndColumn > 21)
+    Assert.True(
+        badL6.Length = 0,
+        sprintf "No Method/Function classification on line 6 should extend past column 21 (end of 'Method'). Found: %A"
+            (badL6 |> Array.map (fun c -> c.Range.StartColumn, c.Range.EndColumn, c.Type)))
+    // Line 7: "let y, z = MyType.Method2<int, string>()"
+    //         ".Method2" ends at col 25, "<int, string>" ends at col 38.
+    let badL7 =
+        items
+        |> Array.filter (fun c ->
+            c.Range.StartLine = 7
+            && (c.Type = SemanticClassificationType.Method
+                || c.Type = SemanticClassificationType.Function)
+            && c.Range.EndColumn > 25)
+    Assert.True(
+        badL7.Length = 0,
+        sprintf "No Method/Function classification on line 7 should extend past column 25 (end of 'Method2'). Found: %A"
+            (badL7 |> Array.map (fun c -> c.Range.StartColumn, c.Range.EndColumn, c.Type)))
+
+/// (#19905 item 4) Generic constructor `new MailboxProcessor<int * int>(.)` must not emit a
+/// type classification covering the `<int * int>` text.
+[<Fact(Skip = "Tracked in #19905 item 4 - DisposableType classification spans <int * int> on generic ctor (pending fix sprint)")>]
+let ``19905 item 4 - generic ctor does not classify type args as type`` () =
+    let source =
+        """
+module Test
+let myMailbox = new MailboxProcessor<int * int>(fun mbx -> async { return () })
+"""
+    let items = getClassifications source
+    // Line 3: "let myMailbox = new MailboxProcessor<int * int>(.)"
+    //         "MailboxProcessor" ends at col 36, "<int * int>" ends at col 47.
+    let badTypeSpans =
+        items
+        |> Array.filter (fun c ->
+            c.Range.StartLine = 3
+            && (c.Type = SemanticClassificationType.ReferenceType
+                || c.Type = SemanticClassificationType.DisposableType
+                || c.Type = SemanticClassificationType.ConstructorForReferenceType)
+            && c.Range.EndColumn > 36)
+    Assert.True(
+        badTypeSpans.Length = 0,
+        sprintf "No type-like classification on line 3 should extend past column 36 (end of 'MailboxProcessor'). Found: %A"
+            (badTypeSpans |> Array.map (fun c -> c.Range.StartColumn, c.Range.EndColumn, c.Type)))
+    let badFuncSpans =
+        items
+        |> Array.filter (fun c ->
+            c.Range.StartLine = 3
+            && (c.Type = SemanticClassificationType.Method
+                || c.Type = SemanticClassificationType.Function)
+            && c.Range.StartColumn >= 36
+            && c.Range.EndColumn <= 47)
+    Assert.True(
+        badFuncSpans.Length = 0,
+        sprintf "No Method/Function classification should cover the <int * int> punctuation on line 3. Found: %A"
+            (badFuncSpans |> Array.map (fun c -> c.Range.StartColumn, c.Range.EndColumn, c.Type)))
+
+/// (#19905 item 5) Open-ended slice `list[0..]` must not emit a Method/Function classification
+/// whose range ends at the closing `]`.
+[<Fact(Skip = "Tracked in #19905 item 5 - Method classification spans list[0..] including trailing ] (pending fix sprint)")>]
+let ``19905 item 5 - open-ended slice does not classify closing bracket as function`` () =
+    let source =
+        """
+module Test
+let list = [1; 2; 3]
+let x = list[0..]
+"""
+    let items = getClassifications source
+    // Line 4: "let x = list[0..]"  — closing ']' is at column 17.
+    let badSpans =
+        items
+        |> Array.filter (fun c ->
+            c.Range.StartLine = 4
+            && (c.Type = SemanticClassificationType.Method
+                || c.Type = SemanticClassificationType.Function)
+            && c.Range.EndColumn = 17)
+    Assert.True(
+        badSpans.Length = 0,
+        sprintf "No Method/Function classification on line 4 should end at column 17 (the ']'). Found: %A"
+            (badSpans |> Array.map (fun c -> c.Range.StartColumn, c.Range.EndColumn, c.Type)))
+
+/// (#19905 item 6) Generic-type static method call `MailboxProcessor<int>.Start(.)` must not
+/// emit a Method classification whose range starts before the `.` (i.e., spans the type name).
+[<Fact(Skip = "Tracked in #19905 item 6 - Method classification spans 'MailboxProcessor<int>.Start' instead of just 'Start' (pending fix sprint)")>]
+let ``19905 item 6 - generic type static method classifies only the method name`` () =
+    let source =
+        """
+module Test
+let mbx = MailboxProcessor<int>.Start(fun mbx -> async { return () })
+"""
+    let items = getClassifications source
+    // Line 3: "let mbx = MailboxProcessor<int>.Start(.)"
+    //         "MailboxProcessor" ends at col 26, "<int>" ends at col 31, ".Start" ends at col 37.
+    // The Method classification for the call should cover only "Start" (cols 32-37), not the
+    // wider "MailboxProcessor<int>.Start" (cols 10-37).
+    let badMethodSpans =
+        items
+        |> Array.filter (fun c ->
+            c.Range.StartLine = 3
+            && c.Type = SemanticClassificationType.Method
+            && c.Range.StartColumn < 32
+            && c.Range.EndColumn = 37)
+    Assert.True(
+        badMethodSpans.Length = 0,
+        sprintf "Method classification on line 3 should cover only 'Start' (32-37), not a wider span. Found: %A"
+            (badMethodSpans |> Array.map (fun c -> c.Range.StartColumn, c.Range.EndColumn, c.Type)))
+    // The type-name classification for MailboxProcessor must not extend past col 26 either.
+    let badTypeSpans =
+        items
+        |> Array.filter (fun c ->
+            c.Range.StartLine = 3
+            && (c.Type = SemanticClassificationType.ReferenceType
+                || c.Type = SemanticClassificationType.DisposableType)
+            && c.Range.EndColumn > 26)
+    Assert.True(
+        badTypeSpans.Length = 0,
+        sprintf "No type-like classification on line 3 should extend past column 26 (end of 'MailboxProcessor'). Found: %A"
+            (badTypeSpans |> Array.map (fun c -> c.Range.StartColumn, c.Range.EndColumn, c.Type)))
+
+/// (#19905 item 7) `open type X.Y` must not be reported as unused when a static member of the
+/// opened type is invoked unqualified below the open.
+/// NOTE: on HEAD with this minimal snippet the unused-opens analysis already returns no
+/// unused opens. The bug from the issue may require a richer setup; we pin the current
+/// passing behaviour so regression of even the simple case is caught.
+[<Fact>]
+let ``19905 item 7 - open type used by static call is not flagged unused`` () =
+    let source =
+        """
+module Test
+module Inner =
+    type Helper() =
+        static member Greet() = "hi"
+open type Inner.Helper
+let _ = Greet()
+"""
+    let fileName, snapshot, checker = singleFileChecker source
+    let results = checker.ParseAndCheckFileInProject(fileName, snapshot) |> Async.RunSynchronously
+    let checkResults = getTypeCheckResult results
+    let lines = source.Replace("\r\n", "\n").Split('\n')
+    let getSourceLineStr n =
+        if n >= 1 && n <= lines.Length then lines[n - 1] else ""
+    let unused =
+        UnusedOpens.getUnusedOpens(checkResults, getSourceLineStr)
+        |> Async.RunSynchronously
+    // The `open type Inner.Helper` is on line 6.
+    let unusedOnOpenLine =
+        unused
+        |> List.filter (fun r -> r.StartLine = 6)
+    Assert.True(
+        unusedOnOpenLine.IsEmpty,
+        sprintf "'open type Inner.Helper' (line 6) must not be flagged unused; got ranges: %A"
+            (unusedOnOpenLine |> List.map (fun r -> r.StartLine, r.StartColumn, r.EndColumn)))
