@@ -171,6 +171,12 @@ module public ParsedInput =
 
     val TryGetCompletionContext: pos: pos * parsedInput: ParsedInput * lineStr: string -> CompletionContext option
 
+    /// Pulls the call-target long identifier, its end position, and the argument expression out of the
+    /// six head shapes of `(|NewObjectOrMethodCall|_|)`. The returned end position matches what
+    /// the active pattern produces, so callers tracking a `CompletionContext.ParameterList(endPos, _)`
+    /// can locate the same node in the parse tree.
+    val internal tryGetCallTargetAndArg: expr: SynExpr -> (LongIdent * pos * SynExpr) option
+
     val GetEntityKind: pos: pos * parsedInput: ParsedInput -> EntityKind option
 
     val GetFullNameOfSmallestModuleOrNamespaceAtPoint: pos: pos * parsedInput: ParsedInput -> string[]

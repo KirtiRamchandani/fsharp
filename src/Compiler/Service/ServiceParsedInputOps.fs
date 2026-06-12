@@ -1132,32 +1132,37 @@ module ParsedInput =
         | Some m -> m.End
         | None -> id.idRange.End
 
-    let (|NewObjectOrMethodCall|_|) e =
-        match e with
+    let tryGetCallTargetAndArg expr =
+        match expr with
         | SynExpr.New(_, SynType.LongIdent typeName, arg, _) ->
             // new A()
-            Some(endOfLastIdent typeName, findSetters arg)
+            Some(typeName.LongIdent, endOfLastIdent typeName, arg)
 
         | SynExpr.New(_, SynType.App(StripParenTypes(SynType.LongIdent typeName), _, _, _, mGreaterThan, _, _), arg, _) ->
             // new A<_>()
-            Some(endOfClosingTokenOrLastIdent mGreaterThan typeName, findSetters arg)
+            Some(typeName.LongIdent, endOfClosingTokenOrLastIdent mGreaterThan typeName, arg)
 
         | SynExpr.App(_, false, SynExpr.Ident id, arg, _) ->
             // A()
-            Some(id.idRange.End, findSetters arg)
+            Some([ id ], id.idRange.End, arg)
 
         | SynExpr.App(_, false, SynExpr.TypeApp(SynExpr.Ident id, _, _, _, mGreaterThan, _, _), arg, _) ->
             // A<_>()
-            Some(endOfClosingTokenOrIdent mGreaterThan id, findSetters arg)
+            Some([ id ], endOfClosingTokenOrIdent mGreaterThan id, arg)
 
         | SynExpr.App(_, false, SynExpr.LongIdent(_, lid, _, _), arg, _) ->
             // A.B()
-            Some(endOfLastIdent lid, findSetters arg)
+            Some(lid.LongIdent, endOfLastIdent lid, arg)
 
         | SynExpr.App(_, false, SynExpr.TypeApp(SynExpr.LongIdent(_, lid, _, _), _, _, _, mGreaterThan, _, _), arg, _) ->
             // A.B<_>()
-            Some(endOfClosingTokenOrLastIdent mGreaterThan lid, findSetters arg)
+            Some(lid.LongIdent, endOfClosingTokenOrLastIdent mGreaterThan lid, arg)
+
         | _ -> None
+
+    let (|NewObjectOrMethodCall|_|) e =
+        tryGetCallTargetAndArg e
+        |> Option.map (fun (_, endPos, arg) -> (endPos, findSetters arg))
 
     let isOnTheRightOfComma pos (elements: SynExpr list) (commas: range list) current =
         let rec loop elements (commas: range list) =

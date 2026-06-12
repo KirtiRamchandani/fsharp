@@ -677,83 +677,18 @@ type internal TypeCheckInfo
                     | None -> None)
             | _ -> [])
 
-    // #19906: locate the call target's LongIdent in the parse tree, given the endPos that
-    // (|NewObjectOrMethodCall|_|) in ServiceParsedInputOps produced for it.
+    // #19906: when typechecking does not capture a Ctor/MethodGroup at endPos (because overload
+    // resolution remained undecided, typically due to a trailing partial named arg), recover the
+    // call target from the parse tree and re-resolve the long identifier off the typecheck path.
+    // Uses TcResultsSink.NoSink so transient resolutions are NOT republished into the sink.
     //
-    // The two arms below (SynExpr.New / SynExpr.App) intentionally mirror the head shapes of
-    // (|NewObjectOrMethodCall|_|) - we must accept exactly the call forms whose endPos that
-    // active pattern produces, no more, no less. To avoid restating each of the six call
-    // shapes, both arms delegate to a single recursive extractor that walks past optional
-    // SynExpr.TypeApp / SynType.App wrappers to the underlying Ident/LongIdent and computes
-    // the same "end of closing '>' or end of last ident" position. If a new call shape is
-    // ever added to (|NewObjectOrMethodCall|_|), it must also be added here.
-    let tryFindCallLongIdentAtEndPos (endOfExprPos: pos) (parseTree: ParsedInput) : LongIdent option =
-        let endOfClosingOr (mGreaterThan: range option) (fallback: pos) =
-            match mGreaterThan with
-            | Some m -> m.End
-            | None -> fallback
-
-        // Returns (LongIdent, end position of the target token: closing '>' if a type app, else end of last ident).
-        let rec exprTarget expr =
-            match expr with
-            | SynExpr.Ident id -> Some([ id ], id.idRange.End)
-            | SynExpr.LongIdent(longDotId = SynLongIdent(id = lid)) ->
-                match List.tryLast lid with
-                | Some last -> Some(lid, last.idRange.End)
-                | None -> None
-            | SynExpr.TypeApp(expr = inner; greaterRange = mGreaterThan) ->
-                match exprTarget inner with
-                | Some(lid, fallback) -> Some(lid, endOfClosingOr mGreaterThan fallback)
-                | None -> None
-            | _ -> None
-
-        let typeTarget ty =
-            match ty with
-            | SynType.LongIdent(SynLongIdent(id = lid)) ->
-                match List.tryLast lid with
-                | Some last -> Some(lid, last.idRange.End)
-                | None -> None
-            | SynType.App(typeName = StripParenTypes(SynType.LongIdent(SynLongIdent(id = lid))); greaterRange = mGreaterThan) ->
-                let fallback =
-                    match List.tryLast lid with
-                    | Some last -> last.idRange.End
-                    | None -> ty.Range.End
-
-                Some(lid, endOfClosingOr mGreaterThan fallback)
-            | _ -> None
-
-        let endsAt (candidate: (LongIdent * pos) option) =
-            match candidate with
-            | Some(lid, endPos) when posEq endPos endOfExprPos -> Some lid
-            | _ -> None
-
-        let mutable found = None
-
-        let visitor =
-            { new SyntaxVisitorBase<unit>() with
-                member _.VisitExpr(_path, _ts, defaultTraverse, expr) =
-                    let lidOpt =
-                        match expr with
-                        | SynExpr.New(targetType = ty) -> endsAt (typeTarget ty)
-                        | SynExpr.App(isInfix = false; funcExpr = funcExpr) -> endsAt (exprTarget funcExpr)
-                        | _ -> None
-
-                    match lidOpt with
-                    | Some lid ->
-                        found <- Some lid
-                        None
-                    | None -> defaultTraverse expr
-            }
-
-        SyntaxTraversal.Traverse(endOfExprPos, parseTree, visitor) |> ignore
-        found
-
-    // #19906: when typechecking fails to capture a method-group resolution at endPos (because
-    // overload resolution remained undecided, typically due to a trailing partial named arg),
-    // recover the call target from the parse tree and re-resolve it manually off the typecheck
-    // path. Uses TcResultsSink.NoSink so transient resolutions are NOT republished into the sink;
-    // the ambient DiagnosticsLogger is left unchanged, which is fine because the only diagnostics
-    // produced here are ones a subsequent dotted-completion request would have raised anyway.
+    // The recovery is gated by the test "Issue 19906 - named arg completion - overloaded
+    // Task.Factory.StartNew" (second/third arg partial); the simpler captured-resolution scan
+    // above is insufficient for those overloaded dotted calls. For dotted targets such as
+    // `Task.Factory.StartNew`, `ResolveLongIdentAsExprAndComputeRange` resolves the leading
+    // segments to a Value/Property and leaves the remaining idents as `rest`, so we then chain
+    // through `ResolveExprDotLongIdentAndComputeRange` to land on the MethodGroup. Fuel is
+    // bounded by `List.length lid` because every step consumes at least one ident.
     let tryRecoverNamedParameterCompletionFromParseTree
         (endOfExprPos: pos)
         (parseTreeOpt: ParsedInput option)
@@ -762,50 +697,49 @@ type internal TypeCheckInfo
         match parseTreeOpt with
         | None -> None
         | Some parseTree ->
-            match tryFindCallLongIdentAtEndPos endOfExprPos parseTree with
+            let visitor =
+                { new SyntaxVisitorBase<LongIdent>() with
+                    member _.VisitExpr(_path, _ts, defaultTraverse, expr) =
+                        match ParsedInput.tryGetCallTargetAndArg expr with
+                        | Some(lid, endPos, _) when posEq endPos endOfExprPos -> Some lid
+                        | _ -> defaultTraverse expr
+                }
+
+            match SyntaxTraversal.Traverse(endOfExprPos, parseTree, visitor) with
             | None -> None
             | Some lid ->
                 let (nenv, ad), _ = GetBestEnvForPos endOfExprPos
                 let typeNameResInfo = TypeNameResolutionInfo.Default
 
-                // Chain through dot accesses (e.g. Type.StaticProp.InstanceMethod) when
-                // ResolveLongIdentAsExprAndComputeRange returns a partial resolution.
-                // Fuel is bounded by the number of idents in the source LongIdent: each step
-                // must consume at least one ident, so we guarantee termination even if
-                // ResolveExprDotLongIdentAndComputeRange ever returns an unchanged rest.
+                let typeOfIntermediateItem (item: Item) (itemRange: range) =
+                    match item with
+                    | Item.Property(info = pinfo :: _) -> Some(pinfo.GetPropertyType(amap, itemRange))
+                    | Item.Value vref -> Some vref.Type
+                    | _ -> None
+
                 let rec chainResolve fuel (item: Item) (rest: Ident list) (itemRange: range) =
                     match rest with
                     | [] -> fromItem item nenv.DisplayEnv nenv ad itemRange
                     | _ when fuel <= 0 -> None
                     | _ ->
-                        let tyOpt =
-                            match item with
-                            | Item.Property(info = pinfo :: _) -> Some(pinfo.GetPropertyType(amap, itemRange))
-                            | Item.Value vref -> Some vref.Type
-                            | _ -> None
-
-                        match tyOpt with
+                        match typeOfIntermediateItem item itemRange with
                         | None -> None
                         | Some ty ->
-                            try
-                                let item, itemRange, _, rest, _ =
-                                    ResolveExprDotLongIdentAndComputeRange
-                                        TcResultsSink.NoSink
-                                        ncenv
-                                        (rangeOfLongIdent rest)
-                                        ad
-                                        nenv
-                                        ty
-                                        rest
-                                        typeNameResInfo
-                                        FindMemberFlag.PreferOverrides
-                                        false
-                                        None
+                            let item, itemRange, _, rest, _ =
+                                ResolveExprDotLongIdentAndComputeRange
+                                    TcResultsSink.NoSink
+                                    ncenv
+                                    (rangeOfLongIdent rest)
+                                    ad
+                                    nenv
+                                    ty
+                                    rest
+                                    typeNameResInfo
+                                    FindMemberFlag.PreferOverrides
+                                    false
+                                    None
 
-                                chainResolve (fuel - 1) item rest itemRange
-                            with
-                            | :? OperationCanceledException -> reraise ()
-                            | _ -> None
+                            chainResolve (fuel - 1) item rest itemRange
 
                 match
                     ResolveLongIdentAsExprAndComputeRange TcResultsSink.NoSink ncenv (rangeOfLongIdent lid) ad nenv typeNameResInfo lid None
@@ -851,33 +785,15 @@ type internal TypeCheckInfo
             | Item.MethodGroup(_, (_ :: _ as methods), _) -> buildFromMethods methods denv nenv ad m
             | _ -> None
 
-        let fromCnr (CNR(item, _, denv, nenv, ad, m)) = fromItem item denv nenv ad m
-
         // #19906: scan all captured resolutions at endPos for a Ctor/MethodGroup, not just the head.
         // A trailing partial named arg can put a refined single-overload MethodGroup or a non-group
         // item (Item.Value/Item.ArgName/Item.Property) at the head after List.rev, shadowing the
-        // original group on the captured-name-resolutions side.
-        let resultFromCaptured =
-            match cnrs |> List.tryPick fromCnr with
-            | Some _ as r -> r
-            | None ->
-                // Fallback: scan the dedicated method-group store directly.
-                sResolutions.CapturedMethodGroupResolutions
-                |> Seq.filter (fun (cnr: CapturedNameResolution) ->
-                    let r = cnr.Range
-                    r.EndLine = endOfExprPos.Line && r.EndColumn = endOfExprPos.Column)
-                |> Seq.tryPick fromCnr
-
+        // original group on the captured-name-resolutions side. If nothing is captured (e.g. overload
+        // resolution remained undecided), fall back to the parse-tree recovery path.
         let result =
-            match resultFromCaptured with
-            | Some _ -> resultFromCaptured
-            | None -> tryRecoverNamedParameterCompletionFromParseTree endOfExprPos parseTreeOpt fromItem
-
-        // TODO #19906: optional arguments on curried let-bound functions
-        // (e.g. `let f (?x:int) (?y:int) = ()`) are invalid F# (FS0718 - optional args are
-        // member-only). The compiler does not produce a MethodGroup/CtorGroup resolution for
-        // such bindings, so neither the captured-resolutions scan above nor the parse-tree
-        // recovery can offer the remaining named args. Deferred to a follow-up sprint.
+            cnrs
+            |> List.tryPick (fun (CNR(item, _, denv, nenv, ad, m)) -> fromItem item denv nenv ad m)
+            |> Option.orElseWith (fun () -> tryRecoverNamedParameterCompletionFromParseTree endOfExprPos parseTreeOpt fromItem)
 
         match result with
         | None -> NameResResult.Empty
