@@ -808,15 +808,7 @@ type internal TypeCheckInfo
                             | _ -> None
 
                 match
-                    ResolveLongIdentAsExprAndComputeRange
-                        TcResultsSink.NoSink
-                        ncenv
-                        (rangeOfLongIdent lid)
-                        ad
-                        nenv
-                        typeNameResInfo
-                        lid
-                        None
+                    ResolveLongIdentAsExprAndComputeRange TcResultsSink.NoSink ncenv (rangeOfLongIdent lid) ad nenv typeNameResInfo lid None
                 with
                 | Result(_, item, itemRange, _, rest, _) -> chainResolve (List.length lid) item rest itemRange
                 | Exception _ -> None
@@ -848,15 +840,7 @@ type internal TypeCheckInfo
                 |> List.collect (fun meth ->
                     let retTy = meth.GetFSharpReturnType(amap, m, meth.FormalMethodInst)
 
-                    ResolveCompletionsInType
-                        ncenv
-                        nenv
-                        ResolveCompletionTargets.SettablePropertiesAndFields
-                        m
-                        ad
-                        false
-                        retTy
-                        allowObsolete)
+                    ResolveCompletionsInType ncenv nenv ResolveCompletionTargets.SettablePropertiesAndFields m ad false retTy allowObsolete)
 
             let parameters = CollectParameters methods amap m
             Some(denv, m, props @ parameters)

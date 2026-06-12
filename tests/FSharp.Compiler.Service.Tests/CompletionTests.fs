@@ -895,9 +895,12 @@ let _ = Task.Factory.StartNew(action=(fun _ -> ()), state=null, c{caret})
 
 [<Fact>]
 let ``Issue 19906 - named arg completion - optional args - second arg partial`` () =
+    // Optional args are only permitted on type members (FS0718), so the issue scenario is
+    // exercised through a member method.
     let info = Checker.getCompletionInfo """
-let f (?x:int) (?y:int) (?z:int) = ()
-let _ = f(?x=1, ?y{caret})
+type C() = member _.M(?x: int, ?y: int, ?z: int) = ()
+let c = C()
+let _ = c.M(x=1, y{caret})
 """
     assertHasItemWithNames ["y"; "z"] info
 
